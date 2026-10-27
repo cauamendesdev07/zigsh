@@ -6,18 +6,76 @@ const ParsedCommand = struct {
     stdout_file: ?[]const u8 = null,
     stderr_file: ?[]const u8 = null,
     is_background: bool = false,
- 
-    pub fn init(allocator: std.mem.Allocator) ParsedCommand {
+    
+    pub fn init() ParsedCommand {
         return .{
-            .args = std.ArrayList([]const u8).init(allocator),
+            .args = std.ArrayList([]const u8).empty,
         };
     }
- 
-    pub fn deinit(self: *ParsedCommand) void {
-        self.args.deinit();
+
+    pub fn deinit(self: *ParsedCommand, allocator: std.mem.Allocator) void {
+        self.args.deinit(allocator);
     }
 };
  
+fn parseCommand(allocator: std.mem.Allocator, input: []const u8) !ParsedCommand {
+    var cmd = ParsedCommand.init();
+    errdefer cmd.deinit(allocator);
+
+    var tokenizer = std.mem.tokenizeAny(u8, input, " \t\r\n");
+
+    while (tokenizer.next()) |token| {
+        if (std.mem.eql(u8, token, ">")) {
+            if (tokenizer.next()) |file| {
+                cmd.stdout_file = file;
+            }
+        } else if (std.mem.eql(u8, token, "2>")) {
+            if (tokenizer.next()) |file| {
+                cmd.stderr_file = file;
+            }
+        } else if (std.mem.eql(u8, token, "<")) {
+            if (tokenizer.next()) |file| {
+                cmd.stdin_file = file;
+            }
+        } else if (std.mem.eql(u8, token, "&")) {
+            cmd.is_background = true;
+        } else {
+            try cmd.args.append(allocator, token);
+        }
+    }
+
+    return cmd;
+}
+
+fn parseLine(allocator: std.mem.Allocator, input: []const u8) !std.ArrayList(ParsedCommand) {
+    var pipeline = std.ArrayList(ParsedCommand).empty;
+    errdefer {
+        for (pipeline.items) |*cmd| {
+            cmd.deinit(allocator);
+        }
+        pipeline.deinit(allocator);
+    }
+
+    var pipeline_iter = std.mem.splitScalar(u8, input, '|');
+
+    while (pipeline_iter.next()) |segment| {
+        const cmd = try parseCommand(allocator, segment);
+        try pipeline.append(allocator, cmd);
+    }
+
+    // Se o último comando for marcado como background, propaga para a pipeline
+    if (pipeline.items.len > 0) {
+        const last_is_bg = pipeline.items[pipeline.items.len - 1].is_background;
+        if (last_is_bg) {
+            for (pipeline.items) |*cmd| {
+                cmd.is_background = true;
+            }
+        }
+    }
+
+    return pipeline;
+}
+
 // Utilização da assinatura idiomática Juicy Main em Zig 0.16.x
 pub fn main(init: std.process.Init) !void {
     //_ = init; // Parâmetro de inicialização do processo em Zig 0.16.x
@@ -70,6 +128,7 @@ pub fn main(init: std.process.Init) !void {
 	}
 
 	_ = line.?; 
+
 
         // TODO 3: Fazer a tokenização da linha e identificar:
         // - Pipeline (|) separando sub-comandos
