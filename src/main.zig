@@ -428,6 +428,18 @@ fn executarPipeline(
             error_file = null;
         }
 
+        // Depois que o consumidor foi criado, o shell não precisa mais manter
+        // aberta a ponta de leitura do pipe anterior. Mantê-la aberta faria o
+        // produtor continuar bloqueado quando o consumidor terminasse antes
+        // (por exemplo, `yes | head -n 1`).
+        if (!is_first) {
+            const previous = &children.items[children.items.len - 1];
+            if (previous.stdout) |file| {
+                file.close(io);
+                previous.stdout = null;
+            }
+        }
+
         children.append(allocator, child) catch |err| {
             child.kill(io);
             for (children.items) |*child_item| child_item.kill(io);
