@@ -28,7 +28,12 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_tests = b.addRunArtifact(exe_tests);
+
+    const integration_tests = b.addSystemCommand(&.{"bash"});
+    integration_tests.addFileArg(b.path("tests/integracao.sh"));
+    integration_tests.addArtifactArg(exe);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_tests.step);
+    test_step.dependOn(&integration_tests.step);
 }
-
