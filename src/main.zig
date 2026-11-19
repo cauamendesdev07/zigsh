@@ -185,45 +185,117 @@ fn executarBuiltin(
 
 
 	
-	fn executarComandoExterno(
-	    cmd: *const ParsedCommand,
-	    io: std.Io,
-	    writer: *std.Io.Writer,
-	) !void {
-	    // Não há comando para executar.
-	    if (cmd.args.items.len == 0) return;
+	
+fn executarComandoExterno(
+    cmd: *const ParsedCommand,
+    io: std.Io,
+    writer: *std.Io.Writer,
+) !void {
+    // Não há comando para executar.
+    if (cmd.args.items.len == 0) return;
 
-	    // Cria um novo processo filho.
-	    var child = std.process.spawn(io, .{
-	        .argv = cmd.args.items,
-	        .stdin = .inherit,
-	        .stdout = .inherit,
-	        .stderr = .inherit,
-	    }) catch |err| {
-	        try writer.print(
-	            "zigsh: não foi possível executar '{s}': {s}\n",
-	            .{ cmd.args.items[0], @errorName(err) },
-	        );
-	        return;
-	    };
+    var input_file: ?std.Io.File = null;
 
-	    // Se possuir &, não aguarda o término do processo.
-	    if (cmd.is_background) {
-	        try writer.writeAll(
-	            "[Processo disparado em segundo plano]\n",
-	        );
-	        return;
-	    }
+    if (cmd.stdin_file) |path| {
+        input_file = std.Io.Dir.cwd().openFile(
+            io,
+            path,
+            .{},
+        ) catch |err| {
+            try writer.print(
+                "zigsh: não foi possível abrir '{s}': {s}\n",
+                .{ path, @errorName(err) },
+            );
+            return;
+        };
+    }
 
-	    // Sem &, aguarda o processo terminar.
-	    _ = child.wait(io) catch |err| {
-	        try writer.print(
-	            "zigsh: erro ao aguardar processo: {s}\n",
-	            .{@errorName(err)},
-	        );
-	        return;
-	    };
-	}
+    // Arquivo opcional para redirecionamento de stdout.
+    var output_file: ?std.Io.File = null;
+    
+    var error_file: ?std.Io.File = null;
+
+    if (cmd.stderr_file) |path| {
+        error_file = std.Io.Dir.cwd().createFile(
+            io,
+            path,
+            .{},
+        ) catch |err| {
+            try writer.print(
+                "zigsh: não foi possível criar '{s}': {s}\n",
+                .{ path, @errorName(err) },
+            );
+            return;
+        };
+     }
+
+    if (cmd.stdout_file) |path| {
+        output_file = std.Io.Dir.cwd().createFile(
+            io,
+            path,
+            .{},
+        ) catch |err| {
+            try writer.print(
+                "zigsh: não foi possível criar '{s}': {s}\n",
+                .{ path, @errorName(err) },
+            );
+            return;
+        };
+    }
+
+    // Fecha o arquivo quando a execução terminar.
+    defer {
+        if (output_file) |file| {
+            file.close(io);
+        }
+    }
+
+    defer {
+        if (error_file) |file| {
+            file.close(io);
+        }
+    }
+
+    defer {
+        if (input_file) |file| {
+            file.close(io);
+        }
+    }
+
+    // Cria o processo filho.
+    var child = std.process.spawn(io, .{
+        .argv = cmd.args.items,
+        .stdin = if (input_file) |file| .{ .file = file } else .inherit,
+
+        // Se houver arquivo, stdout será direcionado para ele.
+        .stdout = if (output_file) |file| .{ .file = file } else .inherit,
+
+        .stderr = if (error_file) |file| .{ .file = file } else .inherit,
+    }) catch |err| {
+        try writer.print(
+            "zigsh: não foi possível executar '{s}': {s}\n",
+            .{ cmd.args.items[0], @errorName(err) },
+        );
+        return;
+    };
+
+    // Se possuir &, não aguarda o término do processo.
+    if (cmd.is_background) {
+        try writer.writeAll(
+            "[Processo disparado em segundo plano]\n",
+        );
+        return;
+    }
+
+    // Sem &, aguarda o processo terminar.
+    _ = child.wait(io) catch |err| {
+        try writer.print(
+            "zigsh: erro ao aguardar processo: {s}\n",
+            .{@errorName(err)},
+        );
+        return;
+    };
+}
 
 
 
@@ -320,8 +392,6 @@ pub fn main(init: std.process.Init) !void {
 
 	    try stdout_writer.interface.flush();
 	}	
-
-        // TODO 5: Configurar e disparar a execução de Comandos Externos via std.process.Child
  
         // TODO 6: Implementar a lógica de leitura/escrita para os arquivos de redirecionamento
  
