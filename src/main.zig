@@ -297,8 +297,180 @@ fn executarComandoExterno(
     };
 }
 
+/// Executa uma pipeline com dois ou mais comandos.
+///
+/// O stdout de cada comando (exceto o último) é criado como `.pipe` e o
+/// descritor de leitura resultante é passado como stdin do próximo comando.
+/// Em foreground, aguarda todos os filhos antes de retornar ao prompt.
+fn executarPipeline(
+    pipeline: []const ParsedCommand,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+) !void {
+    if (pipeline.len < 2) return;
 
+    var children = std.ArrayList(std.process.Child).empty;
+    defer children.deinit(allocator);
 
+    var is_background = false;
+    for (pipeline) |cmd| {
+        if (cmd.is_background) is_background = true;
+    }
+
+    for (pipeline, 0..) |*cmd, index| {
+        if (cmd.args.items.len == 0) {
+            try writer.writeAll("zigsh: pipeline com comando vazio\n");
+            for (children.items) |*child| child.kill(io);
+            return;
+        }
+
+        const is_first = index == 0;
+        const is_last = index == pipeline.len - 1;
+
+        var input_file: ?std.Io.File = null;
+        defer {
+            if (input_file) |file| file.close(io);
+        }
+
+        var output_file: ?std.Io.File = null;
+        defer {
+            if (output_file) |file| file.close(io);
+        }
+
+        var error_file: ?std.Io.File = null;
+        defer {
+            if (error_file) |file| file.close(io);
+        }
+
+        var stdin_behavior: std.process.SpawnOptions.StdIo = .inherit;
+
+        if (is_first) {
+            if (cmd.stdin_file) |path| {
+                input_file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
+                    try writer.print(
+                        "zigsh: não foi possível abrir '{s}': {s}\n",
+                        .{ path, @errorName(err) },
+                    );
+                    for (children.items) |*child| child.kill(io);
+                    return;
+                };
+
+                stdin_behavior = .{ .file = input_file.? };
+            }
+        } else {
+            // O descritor de leitura do pipe do comando anterior pertence ao
+            // `Child` anterior; ele será fechado quando aquele processo for
+            // aguardado (ou explicitamente no caso de background).
+            const previous = &children.items[children.items.len - 1];
+            stdin_behavior = .{ .file = previous.stdout.? };
+        }
+
+        var stdout_behavior: std.process.SpawnOptions.StdIo = .inherit;
+
+        if (!is_last) {
+            // Todo comando intermediário escreve no pipe lido pelo próximo.
+            stdout_behavior = .pipe;
+        } else if (cmd.stdout_file) |path| {
+            output_file = std.Io.Dir.cwd().createFile(io, path, .{}) catch |err| {
+                try writer.print(
+                    "zigsh: não foi possível criar '{s}': {s}\n",
+                    .{ path, @errorName(err) },
+                );
+                for (children.items) |*child| child.kill(io);
+                return;
+            };
+
+            stdout_behavior = .{ .file = output_file.? };
+        }
+
+        var stderr_behavior: std.process.SpawnOptions.StdIo = .inherit;
+
+        if (cmd.stderr_file) |path| {
+            error_file = std.Io.Dir.cwd().createFile(io, path, .{}) catch |err| {
+                try writer.print(
+                    "zigsh: não foi possível criar '{s}': {s}\n",
+                    .{ path, @errorName(err) },
+                );
+                for (children.items) |*child| child.kill(io);
+                return;
+            };
+
+            stderr_behavior = .{ .file = error_file.? };
+        }
+
+        var child = std.process.spawn(io, .{
+            .argv = cmd.args.items,
+            .stdin = stdin_behavior,
+            .stdout = stdout_behavior,
+            .stderr = stderr_behavior,
+        }) catch |err| {
+            try writer.print(
+                "zigsh: não foi possível executar '{s}': {s}\n",
+                .{ cmd.args.items[0], @errorName(err) },
+            );
+            for (children.items) |*child_item| child_item.kill(io);
+            return;
+        };
+
+        // O filho já possui suas próprias cópias dos descritores; o shell pode
+        // fechar as cópias locais usadas apenas durante o spawn.
+        if (input_file) |file| {
+            file.close(io);
+            input_file = null;
+        }
+        if (output_file) |file| {
+            file.close(io);
+            output_file = null;
+        }
+        if (error_file) |file| {
+            file.close(io);
+            error_file = null;
+        }
+
+        // Depois que o consumidor foi criado, o shell não precisa mais manter
+        // aberta a ponta de leitura do pipe anterior. Mantê-la aberta faria o
+        // produtor continuar bloqueado quando o consumidor terminasse antes
+        // (por exemplo, `yes | head -n 1`).
+        if (!is_first) {
+            const previous = &children.items[children.items.len - 1];
+            if (previous.stdout) |file| {
+                file.close(io);
+                previous.stdout = null;
+            }
+        }
+
+        children.append(allocator, child) catch |err| {
+            child.kill(io);
+            for (children.items) |*child_item| child_item.kill(io);
+            return err;
+        };
+    }
+
+    if (is_background) {
+        // Descarta as pontas dos pipes que pertencem ao shell. Os processos
+        // filhos mantêm suas próprias cópias e continuam executando.
+        for (children.items) |*child| {
+            if (child.stdout) |file| {
+                file.close(io);
+                child.stdout = null;
+            }
+        }
+
+        try writer.writeAll("[Processo disparado em segundo plano]\n");
+        return;
+    }
+
+    // Aguarda todos os processos da pipeline antes de retornar ao prompt.
+    for (children.items) |*child| {
+        _ = child.wait(io) catch |err| {
+            try writer.print(
+                "zigsh: erro ao aguardar processo: {s}\n",
+                .{@errorName(err)},
+            );
+        };
+    }
+}
 
 // Utilização da assinatura idiomática Juicy Main em Zig 0.16.x
 pub fn main(init: std.process.Init) !void {
@@ -382,24 +554,22 @@ pub fn main(init: std.process.Init) !void {
 	    }
 	}
 	
-	// TODO 5: Executar comandos externos.
+	// Executa comandos externos e pipelines.
 	if (pipeline.items.len == 1) {
 	    try executarComandoExterno(
 	        &pipeline.items[0],
 	        init.io,
 	        &stdout_writer.interface,
 	    );
+	} else {
+	    try executarPipeline(
+	        pipeline.items,
+	        init.io,
+	        allocator,
+	        &stdout_writer.interface,
+	    );
+	}
 
-	    try stdout_writer.interface.flush();
-	}	
- 
-        // TODO 6: Implementar a lógica de leitura/escrita para os arquivos de redirecionamento
- 
-        // TODO 7: Implementar o encadeamento I/O entre processos conectados por Pipeline (|)
-        // Conectar o stdout.Pipe do processo 1 ao stdin.Pipe do processo 2
- 
-        // TODO 8: Controle de Concorrência:
-        // - Se cmd.is_background == true: exibir mensagem de background e NÃO aguardar
-        // - Se cmd.is_background == false: aguardar a finalização dos processos filhos via child.wait()
+	try stdout_writer.interface.flush();
     }
 }
